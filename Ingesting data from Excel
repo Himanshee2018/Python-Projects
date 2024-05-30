@@ -1,0 +1,243 @@
+import json
+import logging
+import math
+import os
+import pandas as pd
+import pyodbc
+import xml.etree.ElementTree as ET
+from data_config import files_config
+import csv
+import io
+import sys
+from adlfs  import AzureBlobFileSystem
+import xml.etree.ElementTree as ET
+
+def process_xml_content(xml_content):
+    try:
+        root = ET.fromstring(xml_content)
+
+        district_element = root.find('DISTRICT')
+        tr_fets_elem = root.find('TR_FETS')
+        year_element = tr_fets_elem.find('YEAR')
+        
+        district_value = district_element.text if district_element is not None else None
+        year_value = year_element.text if year_element is not None else None
+        
+        data = { 'DISTRICT': [], 'YEAR': [],'FUND_NUM': [], 'GL_CODE': [], 'AMOUNT': [] , 
+                'SCHOOLNUM': [], 'FUNC_CODE': [], 'OBJ_CODE': [],'PROG_CODE': []}
+        
+        data['DISTRICT'].append(district_element.text if district_element is not None else None)
+        data['YEAR'].append(year_value)
+        
+        tr_fets_elem = root.find('TR_FETS')
+        
+        #Extracting district and year
+        district_value = district_element.text if district_element is not None else None
+        year_value = year_element.text if year_element is not None else None
+        
+        data['DISTRICT'].append(root.find('DISTRICT').text)
+        data['YEAR'].append(tr_fets_elem.find('YEAR').text)
+
+        # Iterating through DETAIL elements
+        for detail_elem in tr_fets_elem.findall('.//DETAIL'):
+            data['DISTRICT'].append(district_value)
+            data['YEAR'].append(year_value)
+            data['FUND_NUM'].append(detail_elem.find('FUND_NUM').text)
+            data['GL_CODE'].append(detail_elem.find('GL_CODE').text)
+            data['AMOUNT'].append(detail_elem.find('AMOUNT').text 
+                                  if detail_elem.find('AMOUNT') is not None else 0)
+            data['FUNC_CODE'].append(detail_elem.find('FUNC_CODE').text 
+                                     if detail_elem.find('FUNC_CODE') is not None else None)
+            data['SCHOOLNUM'].append(detail_elem.find('SCHOOLNUM').text 
+                                     if detail_elem.find('SCHOOLNUM') is not None else None)
+            data['OBJ_CODE'].append(detail_elem.find('OBJ_CODE').text 
+                                    if detail_elem.find('OBJ_CODE') is not None else None)
+            data['PROG_CODE'].append(detail_elem.find('PROG_CODE').text 
+                                     if detail_elem.find('PROG_CODE') is not None else None)
+        
+        # Finding the maximum length among the lists
+        max_length = max(len(v) for v in data.values())
+
+        # Pading lists with None to make them of equal length
+        for k, v in data.items():
+            data[k] = v + [None] * (max_length - len(v))
+
+        df_xml = pd.DataFrame(data)
+        df_xml['YEAR'] = year_value
+        return df_xml
+
+    except Exception as e:
+        print(f"Error processing XML: {e}")
+        return None
+    
+def read_azure_blob_storage(account_name, account_key, container_name, blob_path):
+    fs = AzureBlobFileSystem(account_name=account_name, account_key=account_key)
+
+    with fs.open(f"{container_name}/{blob_path}", "rb") as f:
+        blob_content = f.read()
+
+    return blob_content
+
+# Azure Storage account details
+account_name = 'stadevinge5ju'
+account_key = 'f5DeUCl2oZv9g=='
+
+container_name = 'raw-zone/'
+folder_path = 'fets_reporting/raw/'
+file_name = 'S_0400_000_08092012_FET_00010'
+file_format = '.xml'
+
+# Constructing the full path to the XML file
+xml_path = f"{folder_path}{file_name}{file_format}"
+xml_content = read_azure_blob_storage(account_name, account_key, container_name, xml_path)
+# Processing XML content
+df = process_xml_content(xml_content)
+
+# ---------Getting Data from Config file-----
+def filter_config_file(filename):
+    return files_config[filename]
+
+data_config_file= file_name
+data_config = filter_config_file(data_config_file)
+
+# --------------ADDING THE VALIDATIONS------------------------------------
+
+df['GL_CODE'].fillna(0, inplace=True)
+df['GL_CODE'] = df['GL_CODE'].astype(int, errors='ignore')
+df['AMOUNT'].fillna(0, inplace=True)
+df['AMOUNT'] = pd.to_numeric(df['AMOUNT'], errors='coerce')
+df['AMOUNT'] = df['AMOUNT'].astype(float)
+df['SCHOOLNUM'] = df['SCHOOLNUM'].astype(int, errors='ignore')
+
+# -----------Adding the unmapped columns--------------
+def additional_columns(df, data_config):
+    logging.info("Adding extra Columns")
+    # print(data_config)
+    additional_columns = data_config.get("AdditionalColumns")
+    
+    for col in additional_columns:
+        df[col] = None
+    return df
+
+df =additional_columns(df, data_config)
+logging.info("Columns Added")
+
+# ---------------COMMON CONDITIONS---------------------
+
+def apply_conditions_common(df):
+        df.loc[df['GL_CODE'].between(0, 799), 'FinancialAccountBalanceSheetCode'] = df['GL_CODE']
+        df.loc[df['GL_CODE'].between(0, 799), 'FinancialAccountLocalBalanceSheetCode'] = df['GL_CODE']
+        df.loc[df['GL_CODE'].between(800, 899), 'FinancialAccountLocalRevenueCode'] = df['FUNC_CODE']
+        df.loc[df['GL_CODE'].between(800, 899), 'FinancialAccountRevenueCode'] = df['FUNC_CODE']
+        df.loc[df['GL_CODE'] >= 900, 'FinancialExpenditureLocalFunctionCode'] = df['FUNC_CODE']
+        df.loc[df['GL_CODE'] >= 900, 'FinancialExpenditureFunctionCode'] = df['FUNC_CODE']
+        df.loc[df['GL_CODE'] >= 900, 'FinancialExpenditureLocalObjectCode'] = df['OBJ_CODE']
+        df.loc[df['GL_CODE'] >= 900, 'FinancialExpenditureObjectCode'] = df['OBJ_CODE']
+        df.loc[df['GL_CODE'].between(0, 799), 'FinancialAccountCategory'] = 'BalanceSheet'
+        df.loc[df['GL_CODE'].between(800, 899), 'FinancialAccountCategory'] = 'Revenue'
+        df.loc[df['GL_CODE'] >= 900, 'FinancialAccountCategory'] = 'Expenditure'
+        return df
+
+df = apply_conditions_common(df)
+df = df.drop('GL_CODE', axis=1)
+df = df.drop('FUNC_CODE', axis=1)
+df = df.drop('OBJ_CODE', axis=1)
+
+
+# ---------------LEA CONDITIONS-----------------------
+def apply_conditions_lea(df_lea):
+    # df[FinancialAccountBalanceSheetCode] = df.apply(lambda row: row[value_column] if eval(condition) else None, axis=1)
+    df_lea['OrganizationType'] = 'LEA Finance'
+    df_lea['OrganizationIdentifier'] = df['DISTRICT']
+    df_lea['LocalEducationAgencyIdentifier'] = df['DISTRICT']
+    df_lea = df_lea[df_lea['SCHOOLNUM'].isnull()]
+    df_lea = df_lea.drop('SCHOOLNUM', axis=1)
+    return df_lea
+
+# Applying conditions to the DataFrame
+df_lea = apply_conditions_lea(df)
+df_lea = df_lea.drop('DISTRICT', axis=1)
+
+
+# ---------------K12SCHOOL CONDITIONS------------------
+def apply_conditions_lea(df_school):
+    # df[FinancialAccountBalanceSheetCode] = df.apply(lambda row: row[value_column] if eval(condition) else None, axis=1)
+    df_school['OrganizationType'] = 'K12 School Finance'
+    df_school['OrganizationIdentifier'] = df['SCHOOLNUM']
+    df_school['LocalEducationAgencyIdentifier'] = df['DISTRICT']
+    df_school.dropna(subset=['SCHOOLNUM'], inplace=True)
+    return df_school
+
+df_school = apply_conditions_lea(df)
+df_school = df_school.drop('SCHOOLNUM', axis=1)
+df_school = df_school.drop('DISTRICT', axis=1)
+
+
+# ---------------RENAMING COLUMNS---------------------
+
+def rename_columns(df_lea, df_school, data_config):
+    logging.info("Renaming Columns for LEA Datafram")
+    column_rename_dict1 = data_config.get("directRenames", {})
+    df_lea.rename(columns=column_rename_dict1, inplace=True)
+
+    logging.info("Renaming Columns for School DataFrame")
+    column_rename_dict2 = data_config.get("directRenames", {})
+    df_school.rename(columns=column_rename_dict2, inplace=True)
+
+    return df_lea, df_school
+
+# Renaming in both the dataframes
+df_lea, df_school = rename_columns(df_lea, df_school, data_config)
+logging.info("Columns renamed")
+
+# ---------------INGESTING DATA TO AZURE---------------------
+
+folder_path_list = [
+    "raw-zone/fets_reporting/raw/S_0400_000_08092012_FET_00010/",
+
+    # Add other folder paths here
+]
+
+filename_list = [
+    "S_0400_000_08092012_FET_00010.xml",
+    # Add other filenames here
+]
+
+for folder_path, filename in zip(folder_path_list, filename_list):
+
+    filename_without_extension = filename.split(".")[0]
+    # print(filename_without_extension,)
+    input_file_path = folder_path + filename
+    output_file_path_school = (
+    "/".join(folder_path.split("/")[:2])
+    +"/processed/"\
+    +df['DISTRICT'].iloc[0]
+    +';'
+    + "School_Finance"
+    + ".parquet"
+    )
+    output_file_path_lea = (
+    "/".join(folder_path.split("/")[:2])
+    +"/processed/"\
+    +df['DISTRICT'].iloc[0]
+    +';'
+    + "LEA_Finance"
+    + ".parquet"
+    )    
+
+# df_lea.columns = pd.io.common._make_unique(df_lea.columns)
+def export_df(df_lea,df_school,output_file_path_lea,output_file_path_school):
+    raw_datalake_accountkey="f5DeUCl2oZv9ZyIUiBtjMIDfC/U9tAR2iloFlIL4q8R7/EJMnuJffbWftql+cX4PXHZ4gZEdQ1cF+AStpIC0hg=="
+    # storage_path = f"abfs://stadevingest5ju.dfs.core.windows.net/{output_file_path}"
+    df.to_parquet(f"abfs://stadevingest5ju.dfs.core.windows.net/{output_file_path_lea}",
+                  storage_options={"account_key": raw_datalake_accountkey}
+                  )
+    df.to_parquet(f"abfs://stadevingest5ju.dfs.core.windows.net/{output_file_path_school}",
+                  storage_options={"account_key": raw_datalake_accountkey}
+                  )
+    return "Dataframe Persisted"
+
+res = export_df(df_lea,df_school,output_file_path_lea,output_file_path_school)
+logging.info(res)
+
+
